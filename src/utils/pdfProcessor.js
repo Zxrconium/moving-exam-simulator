@@ -5,219 +5,310 @@ pdfjsLib.GlobalWorkerOptions.workerSrc =
 
 const RENDER_SCALE = 2.0
 
-// How many canvas pixels above each label to capture as the image crop.
-// At RENDER_SCALE=2 this equals 220 screen-pixels.  Raise if image tops are
-// clipped; lower if too much whitespace appears above the photo.
-const CAPTURE_HEIGHT = 440
+// ── Pixel-scan constants ────────────────────────────────────────────────────
+// Luminance 0-255: rows/columns whose average exceeds this are background
+// (white margins, gutters between images).  235 catches near-white without
+// mis-classifying lightly-stained microscopy fields.
+const BRIGHT_THRESHOLD = 235
 
-// Labels whose baseline Y values are within this many canvas pixels → same row.
-const Y_ROW_TOLERANCE = 60
+// A bright run must span at least this many consecutive canvas pixels to count
+// as a real separator (prevents isolated bright rows inside images from
+// splitting cells falsely).
+const MIN_SEP_PX = 10
 
-// Gap between two consecutive text items (canvas px) small enough that they
-// belong to the same multi-word label rather than two separate labels.
-const X_MERGE_GAP = 120
+// A dark band must be at least this many canvas pixels to be kept as a cell.
+const MIN_CELL_PX = 80
 
-// Discard text items shorter than this (filters page numbers, stray marks).
-const LABEL_MIN_CHARS = 2
+// Sanity cap: if pixel scan reports > this many cells in one dimension, the
+// detection is unreliable — fall back to the text-based approach.
+const MAX_CELLS_PER_DIM = 12
 
-// ─── Matrix math (inline so we have zero dependency on pdfjsLib.Util) ────────
+// Bottom fraction of each pixel-detected cell that is the "label zone".
+// This portion is cropped off so the answer text is never shown.
+const LABEL_ZONE = 0.20
 
-// Multiply two 2-D affine transforms represented as [a,b,c,d,e,f].
+// ── Text-layer constants ────────────────────────────────────────────────────
+const LABEL_MIN_CHARS = 2   // ignore stray marks / single chars
+const Y_ROW_TOL       = 60  // canvas-px: baseline spread within one label row
+const X_MERGE_GAP     = 120 // canvas-px: gap small enough to merge into same label
+const CAPTURE_HEIGHT  = 440 // canvas-px above each label to capture (text fallback)
+
+// ── Inline 2-D affine matrix multiply (avoids pdfjsLib.Util dependency) ─────
 function matMul(a, b) {
   return [
-    a[0] * b[0] + a[2] * b[1],
-    a[1] * b[0] + a[3] * b[1],
-    a[0] * b[2] + a[2] * b[3],
-    a[1] * b[2] + a[3] * b[3],
-    a[0] * b[4] + a[2] * b[5] + a[4],
-    a[1] * b[4] + a[3] * b[5] + a[5],
+    a[0]*b[0] + a[2]*b[1],
+    a[1]*b[0] + a[3]*b[1],
+    a[0]*b[2] + a[2]*b[3],
+    a[1]*b[2] + a[3]*b[3],
+    a[0]*b[4] + a[2]*b[5] + a[4],
+    a[1]*b[4] + a[3]*b[5] + a[5],
   ]
 }
 
-// ─── Convert one pdfjs text item to canvas-space metrics ─────────────────────
-//
-// Canvas coordinate system: origin top-left, y increases downward.
-// Viewport transform contains a y-flip so PDF's bottom-left origin maps to
-// canvas top-left.  After applying matMul:
-//   tx[4] = left edge of text baseline, canvas px
-//   tx[5] = baseline Y, canvas px  (larger Y = lower on the page)
-//   tx[3] = negative font-size-in-canvas-px  (negative because of y-flip)
-//
-// Therefore:
-//   fontH = Math.abs(tx[3])  — font height in canvas px
-//   textTop = tx[5] - fontH  — top of the glyph (this is the BOTTOM of the image
-//                               crop, because the image lives ABOVE the label)
-
+// ── Map a pdfjs text item into canvas-space metrics ─────────────────────────
+// Canvas y increases downward; the viewport transform flips PDF's y-up axis.
+//   tx[4] = left edge,  canvas px
+//   tx[5] = baseline Y, canvas px  (larger Y = lower on page)
+//   tx[3] = −fontSize in canvas px (negative because of y-flip)
 function itemToCanvas(item, viewport) {
-  const tx = matMul(viewport.transform, item.transform)
-  // Guard: if tx[3] is somehow 0 fall back to tx[0] then a sane default.
+  const tx    = matMul(viewport.transform, item.transform)
   const fontH = Math.abs(tx[3]) || Math.abs(tx[0]) || 14
-  // item.width is in PDF user units.  Multiply by RENDER_SCALE for canvas px.
   const textW = Math.max(item.width * RENDER_SCALE, fontH * 0.3)
   return {
-    str:   item.str.trim(),
-    x:     tx[4],               // left edge, canvas px
-    y:     tx[5],               // baseline Y, canvas px
+    str:  item.str.trim(),
+    x:    tx[4],
+    y:    tx[5],
     fontH,
     textW,
-    cx:    tx[4] + textW / 2,  // horizontal centre of this text item
-    top:   tx[5] - fontH,      // top of glyph = bottom edge of image crop
+    cx:   tx[4] + textW / 2,
+    top:  tx[5] - fontH,   // top of glyph
   }
 }
 
-// ─── Group text items into labelled cells ─────────────────────────────────────
-//
-// Returns an array of rows (sorted top-to-bottom).
-// Each row is an array of merged labels (sorted left-to-right).
-// A "merged label" is one or more adjacent text items that pdfjs may have
-// split, reassembled into a single answer string.
+// ── Pixel-grid detection ─────────────────────────────────────────────────────
 
-function detectLabels(canvasItems) {
-  // 1. Sort all items by baseline Y ascending (top of page first).
+// Returns dark-region bands [[start,end], ...] separated by bright runs.
+// Requires a bright run to be ≥ minSepPx pixels wide before treating it as a
+// real separator; filters out dark bands shorter than minCellPx.
+function darkBands(lum, length, threshold, minCellPx, minSepPx) {
+  // 1. Mark pixels that belong to a qualifying bright separator run.
+  const isSep   = new Uint8Array(length)
+  let runStart  = -1
+  for (let i = 0; i <= length; i++) {
+    const bright = i < length && lum[i] >= threshold
+    if (bright && runStart < 0) { runStart = i }
+    if (!bright && runStart >= 0) {
+      if (i - runStart >= minSepPx) {
+        for (let j = runStart; j < i; j++) isSep[j] = 1
+      }
+      runStart = -1
+    }
+  }
+
+  // 2. Collect dark (non-separator) regions.
+  const bands = []
+  let darkStart = -1
+  for (let i = 0; i <= length; i++) {
+    const dark = i < length && !isSep[i]
+    if (dark  && darkStart < 0)  { darkStart = i }
+    if (!dark && darkStart >= 0) {
+      if (i - darkStart >= minCellPx) bands.push([darkStart, i - 1])
+      darkStart = -1
+    }
+  }
+  return bands
+}
+
+// Scan a rendered canvas and return horizontal + vertical dark-band arrays.
+function detectPixelGrid(canvas, W, H) {
+  const px = canvas.getContext('2d').getImageData(0, 0, W, H).data
+
+  // Row luminance: sample ≤200 columns per row.
+  const xStep  = Math.max(1, Math.floor(W / 200))
+  const rowLum = new Float32Array(H)
+  for (let y = 0; y < H; y++) {
+    let s = 0, n = 0
+    for (let x = 0; x < W; x += xStep) {
+      const i = (y * W + x) * 4
+      s += px[i]*0.299 + px[i+1]*0.587 + px[i+2]*0.114
+      n++
+    }
+    rowLum[y] = s / n
+  }
+
+  // Column luminance: sample ≤200 rows per column.
+  const yStep  = Math.max(1, Math.floor(H / 200))
+  const colLum = new Float32Array(W)
+  for (let x = 0; x < W; x++) {
+    let s = 0, n = 0
+    for (let y = 0; y < H; y += yStep) {
+      const i = (y * W + x) * 4
+      s += px[i]*0.299 + px[i+1]*0.587 + px[i+2]*0.114
+      n++
+    }
+    colLum[x] = s / n
+  }
+
+  return {
+    hBands: darkBands(rowLum, H, BRIGHT_THRESHOLD, MIN_CELL_PX, MIN_SEP_PX),
+    vBands: darkBands(colLum, W, BRIGHT_THRESHOLD, MIN_CELL_PX, MIN_SEP_PX),
+  }
+}
+
+// ── Answer assignment ────────────────────────────────────────────────────────
+
+// Find the label text for the cell region (x0,y0)→(x1,y1).
+// Searches the bottom LABEL_ZONE of the cell first, then just below it.
+function answerForCell(canvasItems, x0, y0, x1, y1) {
+  const cellH     = y1 - y0
+  const labelTopY = y0 + cellH * (1 - LABEL_ZONE)
+
+  // Items whose horizontal centre falls within the cell (±20 px tolerance).
+  const inCol = canvasItems.filter(it => it.cx >= x0 - 20 && it.cx <= x1 + 20)
+
+  // Prefer items in the label zone (bottom fraction of the cell or just below).
+  const inLabel = inCol.filter(it => it.y >= labelTopY && it.y <= y1 + 40)
+  if (inLabel.length > 0) {
+    return inLabel.sort((a, b) => a.y - b.y || a.x - b.x).map(i => i.str).join(' ').trim()
+  }
+
+  // Fallback 1: nearest text row directly below the cell.
+  const below = inCol.filter(it => it.y > y1).sort((a, b) => a.y - b.y)
+  if (below.length > 0) {
+    const nearY = below[0].y
+    return below
+      .filter(it => it.y - nearY < 40)
+      .sort((a, b) => a.x - b.x)
+      .map(it => it.str)
+      .join(' ')
+      .trim()
+  }
+
+  // Fallback 2: any text anywhere inside the cell.
+  const inCell = inCol.filter(it => it.y >= y0 && it.y <= y1)
+  if (inCell.length > 0) {
+    return inCell.sort((a, b) => a.y - b.y || a.x - b.x).map(it => it.str).join(' ').trim()
+  }
+
+  return null
+}
+
+// ── Crop a rectangular region from a canvas into a new canvas ───────────────
+function cropCanvas(src, x, y, w, h) {
+  const dst = document.createElement('canvas')
+  dst.width  = w
+  dst.height = h
+  dst.getContext('2d').drawImage(src, x, y, w, h, 0, 0, w, h)
+  return dst
+}
+
+// ── Text-based extraction (fallback) ─────────────────────────────────────────
+// Groups text items into label rows, then crops a fixed height above each label.
+function textBasedExtraction(canvas, W, canvasItems) {
   const sorted = [...canvasItems].sort((a, b) => a.y - b.y)
-
-  // 2. Cluster into rows.  Each item is compared against the FIRST item's Y in
-  //    each existing row (the minimum Y in that row).  Items are processed in
-  //    ascending Y order so new_item.y >= row_first.y always.
-  const rows = []
+  const rows   = []
   for (const item of sorted) {
     let placed = false
     for (const row of rows) {
-      if (item.y - row[0].y <= Y_ROW_TOLERANCE) {
-        row.push(item)
-        placed = true
-        break
-      }
+      if (item.y - row[0].y <= Y_ROW_TOL) { row.push(item); placed = true; break }
     }
     if (!placed) rows.push([item])
   }
 
-  // 3. Within each row: sort left-to-right, then merge items whose X gap is
-  //    small enough that they're parts of the same multi-word label.
   const labelRows = rows.map(row => {
     row.sort((a, b) => a.x - b.x)
     const merged = []
-
     for (const item of row) {
       const last = merged[merged.length - 1]
-      if (last) {
-        const gap = item.x - (last.x + last.textW)
-        if (gap <= X_MERGE_GAP) {
-          // Extend the running label to include this item.
-          const rightEdge = item.x + item.textW
-          last.str   = (last.str + ' ' + item.str).trim()
-          last.textW = rightEdge - last.x
-          last.cx    = last.x + last.textW / 2
-          // Keep the most extreme metrics.
-          last.y     = Math.max(last.y, item.y)
-          last.fontH = Math.max(last.fontH, item.fontH)
-          last.top   = Math.min(last.top,   item.top)
-          continue
-        }
+      if (last && item.x - (last.x + last.textW) <= X_MERGE_GAP) {
+        last.str   = (last.str + ' ' + item.str).trim()
+        last.textW = (item.x + item.textW) - last.x
+        last.cx    = last.x + last.textW / 2
+        last.y     = Math.max(last.y, item.y)
+        last.fontH = Math.max(last.fontH, item.fontH)
+        last.top   = Math.min(last.top, item.top)
+      } else {
+        merged.push({ ...item })
       }
-      merged.push({ ...item })
     }
     return merged
-  })
+  }).sort((a, b) => a[0].y - b[0].y)
 
-  // 4. Sort rows top-to-bottom.
-  return labelRows.sort((a, b) => a[0].y - b[0].y)
+  const cells = []
+  for (let ri = 0; ri < labelRows.length; ri++) {
+    const row  = labelRows[ri]
+    const n    = row.length
+    const colW = W / n
+    for (let ci = 0; ci < n; ci++) {
+      const label   = row[ci]
+      const cropX   = Math.round(ci * colW)
+      const cropW   = Math.round((ci + 1) * colW) - cropX
+      const cropBot = Math.floor(label.top) - 4
+      const cropTop = Math.max(0, cropBot - CAPTURE_HEIGHT)
+      const cropH   = cropBot - cropTop
+      if (cropW <= 0 || cropH < 20) continue
+      cells.push({
+        imageUrl: cropCanvas(canvas, cropX, cropTop, cropW, cropH).toDataURL('image/jpeg', 0.92),
+        answer:   label.str,
+        cellKey:  `${ri}-${ci}`,
+      })
+    }
+  }
+  return cells
 }
 
-// ─── Core: render one page and crop individual cells ─────────────────────────
+// ── Core per-page extraction ─────────────────────────────────────────────────
 
 async function extractCells(page) {
   const viewport = page.getViewport({ scale: RENDER_SCALE })
   const W = viewport.width
   const H = viewport.height
 
-  // --- Render the full page to an offscreen canvas ---
-  const canvas = document.createElement('canvas')
+  // Render the full page to an offscreen canvas.
+  const canvas  = document.createElement('canvas')
   canvas.width  = W
   canvas.height = H
   await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise
 
-  // --- Pull the text layer.  This is the ANSWER KEY — it is never shown. ---
+  // Extract the text layer — this is the answer key and is NEVER shown.
   const { items: rawItems } = await page.getTextContent()
-  const significant = rawItems.filter(
-    item => typeof item.str === 'string' && item.str.trim().length >= LABEL_MIN_CHARS
-  )
+  const canvasItems = rawItems
+    .filter(it => typeof it.str === 'string' && it.str.trim().length >= LABEL_MIN_CHARS)
+    .map(it => itemToCanvas(it, viewport))
 
-  if (significant.length === 0) {
-    // No extractable text — return the full page without an answer.
-    return [{ imageUrl: canvas.toDataURL('image/jpeg', 0.92), answer: null, cellKey: 'full' }]
-  }
+  // ── Strategy 1: pixel-scan grid detection ──────────────────────────────────
+  const { hBands, vBands } = detectPixelGrid(canvas, W, H)
 
-  const canvasItems = significant.map(item => itemToCanvas(item, viewport))
-  const labelRows   = detectLabels(canvasItems)
+  const isRealGrid =
+    hBands.length >= 1 && vBands.length >= 1 &&
+    (hBands.length > 1 || vBands.length > 1) &&
+    hBands.length <= MAX_CELLS_PER_DIM &&
+    vBands.length <= MAX_CELLS_PER_DIM
 
-  const cells = []
+  if (isRealGrid) {
+    const cells = []
 
-  for (let ri = 0; ri < labelRows.length; ri++) {
-    const row = labelRows[ri]
-    const n   = row.length
+    for (let ri = 0; ri < hBands.length; ri++) {
+      const [y0, y1] = hBands[ri]
+      const cellH    = y1 - y0
 
-    // Equal-width columns: divide the page width evenly by the number of labels
-    // in this row.  Column ci spans [ci·colW, (ci+1)·colW].
-    const colW = W / n
+      for (let ci = 0; ci < vBands.length; ci++) {
+        const [x0, x1] = vBands[ci]
+        const cellW    = x1 - x0
 
-    for (let ci = 0; ci < n; ci++) {
-      const label = row[ci]
+        // Crop the top (1−LABEL_ZONE) of the cell: the microscope image only.
+        // The bottom LABEL_ZONE fraction (where the label text lives) is excluded.
+        const imageH = Math.floor(cellH * (1 - LABEL_ZONE))
+        if (imageH < 20 || cellW < 20) continue
 
-      // --- Horizontal bounds (equal columns) ---
-      const cropX = Math.round(ci * colW)
-      const cropW = Math.round((ci + 1) * colW) - cropX
-
-      // --- Vertical bounds (fixed height above the label) ---
-      // The image sits ABOVE the label, so the crop's bottom edge is just above
-      // the top of the label text, and we extend upward by CAPTURE_HEIGHT.
-      const cropBottom = Math.floor(label.top) - 4       // 4 px gap above text
-      const cropTop    = Math.max(0, cropBottom - CAPTURE_HEIGHT)
-      const cropH      = cropBottom - cropTop
-
-      // Only skip truly degenerate crops (e.g. label IS at the top of the page).
-      if (cropW <= 0 || cropH < 20) continue
-
-      // Crop this cell from the full-page canvas into its own canvas.
-      const cell = document.createElement('canvas')
-      cell.width  = cropW
-      cell.height = cropH
-      cell.getContext('2d').drawImage(
-        canvas, cropX, cropTop, cropW, cropH,
-        0, 0, cropW, cropH
-      )
-
-      cells.push({
-        imageUrl: cell.toDataURL('image/jpeg', 0.92),
-        answer:   label.str,
-        cellKey:  `${ri}-${ci}`,
-      })
+        const answer = answerForCell(canvasItems, x0, y0, x1, y1)
+        cells.push({
+          imageUrl: cropCanvas(canvas, x0, y0, cellW, imageH).toDataURL('image/jpeg', 0.92),
+          answer,
+          cellKey: `${ri}-${ci}`,
+        })
+      }
     }
+
+    if (cells.length > 0) return cells
   }
 
-  // --- Fallback: if nothing was cropped, return the full page with labels
-  //     blacked out (safety net for unusual PDF layouts). ---
-  if (cells.length === 0) {
-    const ctx = canvas.getContext('2d')
-    ctx.fillStyle = '#000'
-    for (const item of canvasItems) {
-      ctx.fillRect(item.x - 10, item.top - 10, item.textW + 20, item.fontH + 20)
-    }
-    return [{
-      imageUrl: canvas.toDataURL('image/jpeg', 0.92),
-      answer:   canvasItems.map(i => i.str).join(' '),
-      cellKey:  'full',
-    }]
+  // ── Strategy 2: text-position based (labels define crop boundaries) ────────
+  if (canvasItems.length > 0) {
+    const cells = textBasedExtraction(canvas, W, canvasItems)
+    if (cells.length > 0) return cells
   }
 
-  return cells
+  // ── Strategy 3: full page, no answer available ─────────────────────────────
+  return [{ imageUrl: canvas.toDataURL('image/jpeg', 0.92), answer: null, cellKey: 'full' }]
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Process a PDF: yields one question slide per image cell per page.
- * A 3×3 grid page produces 9 slides.
+ * Process a PDF file.
+ * Yields one question slide per image cell per page.
+ * A 2-page PDF with 12 images per page produces 24 question slides.
  */
 export async function processPDFFile(file, onProgress) {
   const arrayBuffer = await file.arrayBuffer()
@@ -254,11 +345,11 @@ export async function processPDFFile(file, onProgress) {
 
 /**
  * Process a standalone image file.
- * The filename (extension stripped, separators → spaces) becomes the answer.
+ * The filename (extension stripped, separators → spaces) is the answer.
  */
 export async function processImageFile(file) {
   const imageUrl = await new Promise((resolve, reject) => {
-    const reader = new FileReader()
+    const reader  = new FileReader()
     reader.onload  = e => resolve(e.target.result)
     reader.onerror = reject
     reader.readAsDataURL(file)
