@@ -130,38 +130,37 @@ export default function ExamScreen({ slides, onComplete }) {
     timeLeft > 20 ? 'text-orange-400' : 'text-red-400'
 
   return (
-    <div className="h-screen bg-gray-950 flex flex-col text-white overflow-hidden">
-      {/* Timer bar */}
+    <div className="h-screen bg-gray-950 flex flex-col text-white overflow-hidden relative">
+      {/* Timer bar — fixed at top */}
       <TimerBar timeLeft={timeLeft} paused={phase === 'revealed'} />
 
-      {/* Top bar: slide counter + timer */}
-      <div className="flex items-center justify-between px-6 py-2.5 text-sm shrink-0">
-        <span className="text-gray-400 font-mono tracking-wide">
-          Slide {currentIdx + 1} / {slides.length}
+      {/* Slim status row */}
+      <div className="flex items-center justify-between px-4 py-1.5 text-xs shrink-0 z-10">
+        <span className="text-gray-500 font-mono">
+          {currentIdx + 1} / {slides.length}
         </span>
-        <span className={`font-mono font-bold text-base tabular-nums ${
+        <span className={`font-mono font-bold tabular-nums ${
           phase === 'revealed' ? 'text-gray-700' : timerColor
         }`}>
           {phase === 'revealed' ? '—' : `${timeLeft}s`}
         </span>
       </div>
 
-      {/* Image area */}
-      <div className="flex-1 flex items-center justify-center px-4 pb-2 min-h-0">
+      {/* Image — fills remaining space */}
+      <div className="flex-1 flex items-center justify-center min-h-0 overflow-hidden">
         <img
           key={currentSlide.id}
           src={currentSlide.imageUrl}
           alt="Exam slide"
-          className="exam-image max-w-full max-h-full object-contain rounded-xl shadow-2xl"
-          style={{ maxHeight: 'calc(100vh - 240px)' }}
+          className="exam-image w-full h-full object-contain"
           draggable={false}
         />
       </div>
 
-      {/* Answer panel */}
-      <div className="shrink-0 bg-gray-900 border-t border-gray-800 px-6 py-4">
+      {/* Answer panel — slim overlay pinned to bottom */}
+      <div className="shrink-0 bg-gray-900/95 backdrop-blur border-t border-gray-800 px-4 py-3">
         {phase === 'answering' ? (
-          <div className="max-w-2xl mx-auto flex gap-3">
+          <div className="max-w-2xl mx-auto flex gap-2">
             <input
               ref={inputRef}
               type="text"
@@ -169,8 +168,8 @@ export default function ExamScreen({ slides, onComplete }) {
               onChange={e => setUserAnswer(e.target.value)}
               placeholder="Type your answer and press Enter…"
               className="
-                flex-1 bg-gray-800 text-white border border-gray-700 rounded-xl
-                px-4 py-3 text-base focus:outline-none focus:border-blue-500
+                flex-1 bg-gray-800 text-white border border-gray-700 rounded-lg
+                px-3 py-2 text-sm focus:outline-none focus:border-blue-500
                 placeholder-gray-600 transition-colors
               "
               autoComplete="off"
@@ -180,67 +179,41 @@ export default function ExamScreen({ slides, onComplete }) {
               onClick={() => submitAnswer(userAnswer)}
               className="
                 bg-blue-600 hover:bg-blue-500 active:bg-blue-700
-                text-white px-6 py-3 rounded-xl font-semibold transition-colors
-                shrink-0
+                text-white px-5 py-2 rounded-lg font-semibold text-sm transition-colors shrink-0
               "
             >
               Submit
             </button>
           </div>
         ) : (
-          <div className="max-w-2xl mx-auto space-y-3">
-            {/* Result card */}
-            <div className={`
-              rounded-xl p-4 border
-              ${effectiveCorrect
-                ? 'bg-green-950/60 border-green-700'
-                : 'bg-red-950/60 border-red-800'
-              }
-            `}>
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <p className={`text-lg font-bold mb-1 ${effectiveCorrect ? 'text-green-400' : 'text-red-400'}`}>
-                    {effectiveCorrect
-                      ? '✓ Correct!'
-                      : results[results.length - 1]?.expired
-                        ? '⏱ Time\'s up'
-                        : '✗ Incorrect'
-                    }
-                  </p>
-                  <p className="text-sm text-gray-400">
-                    Correct answer:{' '}
-                    <span className="text-white font-semibold">{currentSlide.answer}</span>
-                  </p>
-                  {!effectiveCorrect && userAnswer && (
-                    <p className="text-xs text-gray-600 mt-1">
-                      You answered: &ldquo;{userAnswer}&rdquo;
-                    </p>
-                  )}
-                </div>
-              </div>
+          <div className="max-w-2xl mx-auto space-y-2">
+            {/* Compact result row */}
+            <div className={`rounded-lg px-3 py-2 border flex items-center gap-3 flex-wrap
+              ${effectiveCorrect ? 'bg-green-950/60 border-green-800' : 'bg-red-950/60 border-red-900'}`}
+            >
+              <span className={`font-bold text-sm shrink-0 ${effectiveCorrect ? 'text-green-400' : 'text-red-400'}`}>
+                {effectiveCorrect ? '✓ Correct!' : results[results.length - 1]?.expired ? '⏱ Time\'s up' : '✗ Wrong'}
+              </span>
+              <span className="text-gray-300 text-sm min-w-0">
+                <span className="text-gray-500">Answer: </span>
+                <span className="font-semibold text-white">{currentSlide.answer}</span>
+              </span>
+              {!effectiveCorrect && userAnswer && (
+                <span className="text-gray-600 text-xs">You: &ldquo;{userAnswer}&rdquo;</span>
+              )}
             </div>
 
             {/* Action buttons */}
-            <div className="flex gap-3">
+            <div className="flex gap-2">
               {!effectiveCorrect && (
-                <button
-                  onClick={markCorrect}
-                  className="
-                    bg-amber-800 hover:bg-amber-700 active:bg-amber-900
-                    text-amber-100 px-4 py-2.5 rounded-xl text-sm font-medium
-                    transition-colors shrink-0
-                  "
-                  title="Override: count this answer as correct"
+                <button onClick={markCorrect}
+                  className="bg-amber-800 hover:bg-amber-700 text-amber-100 px-3 py-2 rounded-lg text-xs font-medium transition-colors shrink-0"
                 >
-                  Mark as Correct
+                  Mark Correct
                 </button>
               )}
-              <button
-                onClick={advance}
-                className="
-                  flex-1 bg-gray-700 hover:bg-gray-600 active:bg-gray-800
-                  text-white py-2.5 rounded-xl font-semibold transition-colors
-                "
+              <button onClick={advance}
+                className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2 rounded-lg font-semibold text-sm transition-colors"
               >
                 {isLastSlide ? 'See Results →' : 'Next Slide →'}
               </button>
